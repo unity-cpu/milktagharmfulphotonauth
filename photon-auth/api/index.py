@@ -1,4 +1,5 @@
-import json
+import hashlib
+import hmac
 import os
 import threading
 import time
@@ -10,13 +11,35 @@ from flask import Flask, jsonify, request
 # ---------------------------------------------------------------------------
 class GameInfo:
     def __init__(self) -> None:
-        # IMPORTANT: must match PlayFabAuthenticatorDEV.TITLE_ID in Unity
+        # Must match Unity's TITLE_ID
         self.TitleId: str = "116C19"
         self.SecretKey: str = "FN87SC9HGNFQD93THWQ9YARI7DF4CFPU6XUKJ51JHI4GSSGBEO"
         self.AppCreds: str = "OC|1301286683067668|71b4414bb45875826af351f631d6b342"
 
-        # Photon realtime App ID — must match Unity's APP_ID_REALTIME
+        # Must match Unity's APP_ID_REALTIME
         self.PhotonAppId: str = "d367d3f3-d294-4eef-8b35-3d0722fab130"
+
+        # ============================================================
+        #  HARDENING
+        # ============================================================
+        # Shared HMAC-SHA256 secret. MUST match CLIENT_HMAC_SECRET in Unity.
+        self.ClientHmacSecret: str = "REPLACE_ME_WITH_A_LONG_RANDOM_HEX_STRING_AT_LEAST_64_CHARS"
+
+        # Must match Unity's APP_VERSION. Empty to disable.
+        self.ExpectedAppVersion: str = "live11143"
+
+        # Timestamp tolerance (seconds)
+        self.MaxTimestampSkew: int = 60
+
+        # Nonce TTL (seconds)
+        self.NonceTtl: int = 300
+
+        # Per-IP rate limit
+        self.RateLimitMax: int = 15
+        self.RateLimitWindow: int = 60
+
+        # Auto-ban on hardening failures
+        self.BanOnHardeningFailure: bool = True
 
     def GetAuthHeaders(self) -> dict[str, str]:
         return {
@@ -27,23 +50,19 @@ class GameInfo:
 settings = GameInfo()
 app = Flask(__name__)
 
-# Discord webhooks
 SuccessfulAuthy = "https://discord.com/api/webhooks/1560359190655140010/pWCP3zU1gzl6FkkgKYaNrItnUhxl54IBYXuyl00UJZEEs2w0PBkYwvPh1ECYDKGMTUYM"
-FailedAuthy = "https://discord.com/api/webhooks/1560359190655140010/pWCP3zU1gzl6FkkgKYaNrItnUhxl54IBYXuyl00UJZEEs2w0PBkYwvPh1ECYDKGMTUYM"
+FailedAuthy     = "https://discord.com/api/webhooks/1560359190655140010/pWCP3zU1gzl6FkkgKYaNrItnUhxl54IBYXuyl00UJZEEs2w0PBkYwvPh1ECYDKGMTUYM"
 
-# Upstash Redis
-UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_URL   = os.environ.get("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 
-# Ban settings
-BAN_ON_INVALID_TOKEN = True
-BAN_ON_MISSING_PARAMS = False
-BAN_BY_IP = False
-BAN_BY_USERNAME = True
-BAN_TTL_SECONDS = 0
+BAN_ON_INVALID_TOKEN   = True
+BAN_ON_MISSING_PARAMS  = False
+BAN_BY_IP              = False
+BAN_BY_USERNAME        = True
+BAN_TTL_SECONDS        = 0
 
-# Webhook spam control
-WEBHOOK_COOLDOWN = 0
+WEBHOOK_COOLDOWN  = 0
 NOTIFY_ON_BAN_HIT = False
 
 # ---------------------------------------------------------------------------
@@ -51,7 +70,6 @@ NOTIFY_ON_BAN_HIT = False
 # ---------------------------------------------------------------------------
 def _redis(cmd, *args):
     if not UPSTASH_URL or not UPSTASH_TOKEN:
-        print("[redis] env vars missing — bans will NOT persist")
         return None
     try:
         r = requests.post(
@@ -64,8 +82,7 @@ def _redis(cmd, *args):
             timeout=5,
         )
         return r.json().get("result")
-    except Exception as e:
-        print(f"[redis] {cmd} failed: {e}")
+    except Exception:
         return None
 
 def _ban_key_username(username: str) -> str:
@@ -102,6 +119,54 @@ def remove_ban(username, ip) -> None:
         _redis("DEL", _ban_key_ip(ip))
 
 # ---------------------------------------------------------------------------
+# HARDENING HELPERS
+# ---------------------------------------------------------------------------
+def _rate_limit_check(ip: str) -> bool:
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return True
+    bucket = int(time.time() // settings.RateLimitWindow)
+    key = f"rl:{ip}:{bucket}"
+    count = _redis("INCR", key)
+    if count == 1:
+        _redis("EXPIRE", key, str(settings.RateLimitWindow))
+    try:
+        return int(count) <= settings.RateLimitMax
+    except (TypeError, ValueError):
+        return True
+
+def _consume_nonce(nonce: str) -> bool:
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return True
+    key = f"nonce:{nonce}"
+    result = _redis("SET", key, "1", "EX", str(settings.NonceTtl), "NX")
+    return result == "OK"
+
+def _timestamp_ok(ts) -> bool:
+    try:
+        t = int(ts)
+    except (TypeError, ValueError):
+        return False
+    return abs(time.time() - t) <= settings.MaxTimestampSkew
+
+def _version_ok(v) -> bool:
+    if not settings.ExpectedAppVersion:
+        return True
+    return v == settings.ExpectedAppVersion
+
+def _verify_hmac(username: str, token: str, ts: str, nonce: str, sig: str) -> bool:
+    if not settings.ClientHmacSecret or settings.ClientHmacSecret.startswith("REPLACE_ME"):
+        return False
+    if not sig:
+        return False
+    message = f"{username}|{token}|{ts}|{nonce}"
+    expected = hmac.new(
+        settings.ClientHmacSecret.encode(),
+        message.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, sig.lower())
+
+# ---------------------------------------------------------------------------
 # WEBHOOKS
 # ---------------------------------------------------------------------------
 _wh_lock = threading.Lock()
@@ -134,8 +199,8 @@ def send_discord_log(key: str, webhook_url: str, title: str, description: str, c
             }]},
             timeout=5
         )
-    except Exception as e:
-        print(f"Failed to send Discord webhook: {e}")
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # CLIENT IP (Vercel-aware)
@@ -156,9 +221,6 @@ def get_client_ip():
 # PLAYFAB HELPERS
 # ---------------------------------------------------------------------------
 def playfab_authenticate_session_ticket(session_ticket: str):
-    """
-    Server API: validate a session ticket. Returns (ok, playfab_id, raw_json).
-    """
     url = f"https://{settings.TitleId}.playfabapi.com/Server/AuthenticateSessionTicket"
     try:
         r = requests.post(
@@ -170,9 +232,7 @@ def playfab_authenticate_session_ticket(session_ticket: str):
             },
             timeout=10,
         )
-        print(f"[PlayFab][AuthenticateSessionTicket] status={r.status_code} body={r.text}")
     except Exception as e:
-        print(f"[PlayFab] AuthenticateSessionTicket request failed: {e}")
         return False, None, {"error": str(e)}
 
     try:
@@ -186,12 +246,6 @@ def playfab_authenticate_session_ticket(session_ticket: str):
     return False, None, data
 
 def playfab_get_photon_token(session_ticket: str):
-    """
-    Client API: get the Photon custom auth token for the player who owns
-    this session ticket. Uses X-Authorization (bearer) — the session ticket
-    acts as proof of identity, so this works from a server too.
-    Returns (ok, photon_token, raw_json).
-    """
     url = f"https://{settings.TitleId}.playfabapi.com/Client/GetPhotonAuthenticationToken"
     try:
         r = requests.post(
@@ -203,9 +257,7 @@ def playfab_get_photon_token(session_ticket: str):
             },
             timeout=10,
         )
-        print(f"[PlayFab][GetPhotonAuthenticationToken] status={r.status_code} body={r.text}")
     except Exception as e:
-        print(f"[PlayFab] GetPhotonAuthenticationToken request failed: {e}")
         return False, None, {"error": str(e)}
 
     try:
@@ -221,29 +273,33 @@ def playfab_get_photon_token(session_ticket: str):
 # ---------------------------------------------------------------------------
 # AUTH HANDLER
 # ---------------------------------------------------------------------------
+def _getp(body, *names):
+    for n in names:
+        v = request.args.get(n)
+        if v:
+            return v
+        v = body.get(n)
+        if v:
+            return v
+    return None
+
 def photonauth():
     client_ip = get_client_ip()
     body = request.get_json(silent=True) or {}
 
-    print(f"Received {request.method} {request.path} from {client_ip}")
-    print(f"Query args: {dict(request.args)}")
+    username = _getp(body, "username", "user", "UserId")
+    token    = _getp(body, "token", "Ticket", "sessionTicket")
+    ts       = _getp(body, "ts", "timestamp")
+    nonce    = _getp(body, "nonce")
+    sig      = _getp(body, "sig", "signature")
+    app_ver  = _getp(body, "appVersion", "version", "AppVersion")
 
-    username = (
-        request.args.get("username") or body.get("username")
-        or request.args.get("user") or request.args.get("UserId")
-        or body.get("UserId") or body.get("user")
-    )
-    token = (
-        request.args.get("token") or body.get("token")
-        or request.args.get("Ticket") or request.args.get("sessionTicket")
-        or body.get("Ticket") or body.get("sessionTicket")
-    )
-
-    print(f"username={username}, token={token}")
+    # HARDENING LAYER 1: rate limit
+    if not _rate_limit_check(client_ip):
+        return jsonify({"ResultCode": 4, "Message": "Rate limit exceeded"}), 429
 
     banned, ban_type = is_banned(username, client_ip)
     if banned:
-        print(f"Blocked banned {ban_type}: username={username} ip={client_ip}")
         if NOTIFY_ON_BAN_HIT:
             send_discord_log(
                 f"banned-hit:{ban_type}:{(username or '').lower()}:{client_ip}",
@@ -264,9 +320,55 @@ def photonauth():
         )
         return jsonify({"ResultCode": 3, "Message": "Missing username or token"}), 200
 
-    # -----------------------------------------------------------------------
-    # STEP 1 — validate the session ticket (server API, X-SecretKey)
-    # -----------------------------------------------------------------------
+    # HARDENING LAYER 2: version
+    if not _version_ok(app_ver):
+        if settings.BanOnHardeningFailure:
+            add_ban(username, client_ip, f"bad app version: {app_ver}")
+        send_discord_log(
+            f"hard-version:{client_ip}:{username}",
+            FailedAuthy, "Photon Auth Blocked - Version",
+            f"```IP: {client_ip}\nusername: {username}\nappVersion: {app_ver}\nexpected: {settings.ExpectedAppVersion}```",
+            0x8B0000
+        )
+        return jsonify({"ResultCode": 5, "Message": "Outdated client"}), 200
+
+    # HARDENING LAYER 3: timestamp
+    if not _timestamp_ok(ts):
+        if settings.BanOnHardeningFailure:
+            add_ban(username, client_ip, f"bad timestamp: {ts}")
+        send_discord_log(
+            f"hard-ts:{client_ip}:{username}",
+            FailedAuthy, "Photon Auth Blocked - Timestamp",
+            f"```IP: {client_ip}\nusername: {username}\nts: {ts}\nskew limit: {settings.MaxTimestampSkew}s```",
+            0x8B0000
+        )
+        return jsonify({"ResultCode": 5, "Message": "Timestamp out of range"}), 200
+
+    # HARDENING LAYER 4: HMAC
+    if not _verify_hmac(username, token, ts, nonce, sig):
+        if settings.BanOnHardeningFailure:
+            add_ban(username, client_ip, "bad hmac signature")
+        send_discord_log(
+            f"hard-hmac:{client_ip}:{username}",
+            FailedAuthy, "Photon Auth Blocked - Bad Signature",
+            f"```IP: {client_ip}\nusername: {username}\nReceived sig: {sig}```",
+            0x8B0000
+        )
+        return jsonify({"ResultCode": 5, "Message": "Bad signature"}), 200
+
+    # HARDENING LAYER 5: nonce replay
+    if not nonce or not _consume_nonce(nonce):
+        if settings.BanOnHardeningFailure:
+            add_ban(username, client_ip, f"nonce replay: {nonce}")
+        send_discord_log(
+            f"hard-nonce:{client_ip}:{username}",
+            FailedAuthy, "Photon Auth Blocked - Replay",
+            f"```IP: {client_ip}\nusername: {username}\nnonce: {nonce}```",
+            0x8B0000
+        )
+        return jsonify({"ResultCode": 5, "Message": "Replay detected"}), 200
+
+    # STEP 1 — validate session ticket
     ok, playfab_id, auth_data = playfab_authenticate_session_ticket(token)
 
     if not ok or not playfab_id:
@@ -279,7 +381,6 @@ def photonauth():
         if BAN_ON_INVALID_TOKEN:
             add_ban(username, client_ip, f"failed auth: {reason}")
 
-        print(f"Auth FAILED -> banned username={username} ip={client_ip} reason={reason}")
         send_discord_log(
             f"fail:{client_ip}:{(username or '').lower()}:{token}",
             FailedAuthy, "Photon Auth Failed - Banned",
@@ -288,26 +389,18 @@ def photonauth():
         )
         return jsonify({"ResultCode": 2, "Message": reason}), 200
 
-    # -----------------------------------------------------------------------
-    # STEP 2 — get the Photon token (client API, X-Authorization = ticket)
-    # -----------------------------------------------------------------------
+    # STEP 2 — fetch full Photon token
     photon_ok, photon_token, photon_data = playfab_get_photon_token(token)
 
     if not photon_ok or not photon_token:
-        # Not a ban condition — the ticket was valid, so the player is legit.
-        # Most likely the PlayFab title doesn't have Photon as an add-on enabled,
-        # or the PhotonApplicationId is wrong.
-        print(f"Auth OK but PhotonToken MISSING for {playfab_id}. "
-              f"Check PlayFab title → Add-ons → Photon and PhotonAppId.")
-
         send_discord_log(
             f"success-no-photon:{playfab_id}",
             SuccessfulAuthy, "Photon Auth OK (no token)",
             f"```PlayFabId: {playfab_id}\nusername: {username}\nIP: {client_ip}\n"
-            f"Reason: GetPhotonAuthenticationToken did not return a token```",
+            f"Reason: GetPhotonAuthenticationToken did not return a token\n"
+            f"Raw: {photon_data}```",
             0xF1C40F
         )
-
         return jsonify({
             "ResultCode": 1,
             "UserId": playfab_id,
@@ -316,14 +409,15 @@ def photonauth():
             "Message": "Authenticated but no PhotonToken returned"
         }), 200
 
-    # ---------- FULL SUCCESS ----------
-    print(f"Auth success for {playfab_id}, PhotonToken present")
-
+    # FULL SUCCESS — full token, no truncation
     send_discord_log(
         f"success:{playfab_id}",
         SuccessfulAuthy, "Photon Auth Success",
-        f"```PlayFabId: {playfab_id}\nusername: {username}\nIP: {client_ip}\n"
-        f"PhotonToken: {photon_token[:32]}...```",
+        f"```PlayFabId: {playfab_id}\n"
+        f"username: {username}\n"
+        f"IP: {client_ip}\n"
+        f"SessionTicket: {token}\n"
+        f"PhotonToken: {photon_token}```",
         0x3498DB
     )
 
@@ -364,14 +458,12 @@ def admin_bans():
     }), 200
 
 # ---------------------------------------------------------------------------
-# CATCH-ALL (required for Vercel rewrites)
+# CATCH-ALL (Vercel rewrites)
 # ---------------------------------------------------------------------------
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
 @app.route("/<path:path>", methods=["GET", "POST"])
 def catch_all(path):
     full_path = "/" + path if path else "/"
-
-    print(f"[catch_all] reconstructed path: {full_path}")
 
     if "admin/unban" in full_path or "admin/unban" in request.path:
         return admin_unban()
