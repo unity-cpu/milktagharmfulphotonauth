@@ -10,7 +10,10 @@ from flask import Flask, jsonify, request
 # ---------------------------------------------------------------------------
 class GameInfo:
     def __init__(self) -> None:
-        self.TitleId: str = "1F3B21"
+        # IMPORTANT: must match the TitleId your Unity client logs into
+        # (PlayFabAuthenticatorDEV.TITLE_ID). If these differ, the session
+        # ticket from the client will NOT validate here.
+        self.TitleId: str = "116C19"
         self.SecretKey: str = "FN87SC9HGNFQD93THWQ9YARI7DF4CFPU6XUKJ51JHI4GSSGBEO"
         self.AppCreds: str = "OC|1301286683067668|71b4414bb45875826af351f631d6b342"
 
@@ -194,13 +197,23 @@ def photonauth():
         )
         return jsonify({"ResultCode": 3, "Message": "Missing username or token"}), 200
 
-    playfab_auth_url = f"https://{settings.TitleId}.playfabapi.com/photon/authenticate"
+    # -----------------------------------------------------------------------
+    # PlayFab Server/AuthenticateSessionTicket
+    #   - POST, JSON body {"SessionTicket": "<client's ticket>"}
+    #   - X-SecretKey header (server-side auth)
+    #   - success: {"code": 200, "data": {"UserInfo": {"PlayFabId": "..."}}}
+    #   - failure: {"code": 401/400/..., "errorMessage": "..."}
+    # -----------------------------------------------------------------------
+    playfab_auth_url = f"https://{settings.TitleId}.playfabapi.com/Server/AuthenticateSessionTicket"
     try:
-        auth_req = requests.get(
+        auth_req = requests.post(
             url=playfab_auth_url,
-            params={"username": username, "token": token},
-            headers=settings.GetAuthHeaders(),
-            timeout=10
+            json={"SessionTicket": token},
+            headers={
+                "content-type": "application/json",
+                "X-SecretKey": settings.SecretKey,
+            },
+            timeout=10,
         )
         print(f"PlayFab status: {auth_req.status_code}")
         print(auth_req.text)
@@ -219,41 +232,38 @@ def photonauth():
     except Exception:
         result = {}
 
-    # PlayFab wraps data under "data" sometimes; unwrap if present
-    if "data" in result and isinstance(result["data"], dict):
-        result = result["data"]
-
-    result_code = result.get("ResultCode", result.get("resultCode"))
-    user_id = result.get("UserId") or result.get("userId") or username
+    pf_code = result.get("code", 0)
+    pf_data = result.get("data") or {}
+    user_info = pf_data.get("UserInfo") or {}
+    playfab_id = user_info.get("PlayFabId")
 
     # ---------- SUCCESS ----------
-    if auth_req.status_code == 200 and result_code == 1:
-        # THIS IS THE LINE YOU WERE MISSING
-        photon_token = (
-            result.get("PhotonToken")
-            or result.get("photonToken")
-            or result.get("Token")
-            or result.get("token")
-        )
-
-        print(f"Auth success for {user_id}, PhotonToken={'yes' if photon_token else 'NO'}")
+    if pf_code == 200 and playfab_id:
+        print(f"Auth success for {playfab_id}")
 
         send_discord_log(
-            f"success:{user_id}",
+            f"success:{playfab_id}",
             SuccessfulAuthy, "Photon Auth Success",
-            f"```PlayFabId: {user_id}\nusername: {username}\nIP: {client_ip}```",
+            f"```PlayFabId: {playfab_id}\nusername: {username}\nIP: {client_ip}```",
             0x3498DB
         )
 
+        # Photon custom-auth only needs ResultCode + UserId.
+        # It does NOT need a PhotonToken; the client already obtains its
+        # PhotonCustomAuthenticationToken from PlayFab directly.
         return jsonify({
             "ResultCode": 1,
-            "UserId": user_id,
-            "PhotonToken": photon_token,
+            "UserId": playfab_id,
             "Message": "Authentication successful"
         }), 200
 
     # ---------- FAILURE ----------
-    reason = result.get("message") or result.get("Message") or "Invalid token"
+    reason = (
+        result.get("errorMessage")
+        or result.get("error")
+        or result.get("status")
+        or "Invalid session ticket"
+    )
     if BAN_ON_INVALID_TOKEN:
         add_ban(username, client_ip, f"failed auth: {reason}")
 
