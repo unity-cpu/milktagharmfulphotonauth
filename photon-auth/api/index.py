@@ -11,7 +11,7 @@ from flask import Flask, jsonify, request
 class GameInfo:
     def __init__(self) -> None:
         self.TitleId: str = "1F3B21"
-        self.SecretKey: str = "CN55CBE6BAMY6FBBDY4GU75MA33MAX8ZYE14YBQ6GAI5PNXE64"
+        self.SecretKey: str = "FN87SC9HGNFQD93THWQ9YARI7DF4CFPU6XUKJ51JHI4GSSGBEO"
         self.AppCreds: str = "OC|1301286683067668|71b4414bb45875826af351f631d6b342"
 
     def GetAuthHeaders(self) -> dict[str, str]:
