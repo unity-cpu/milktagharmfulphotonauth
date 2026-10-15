@@ -1,11 +1,12 @@
 import json
+import os
 import threading
 import time
 import requests
 from flask import Flask, jsonify, request
 
 # ---------------------------------------------------------------------------
-# CONFIG  ->  fill these in
+# CONFIG
 # ---------------------------------------------------------------------------
 class GameInfo:
     def __init__(self) -> None:
@@ -22,37 +23,45 @@ class GameInfo:
 settings = GameInfo()
 app = Flask(__name__)
 
-# Discord webhooks (leave empty to disable)
+# --- VERCEL PATH RESTORATION -------------------------------------------------
+# Vercel rewrites every path to /api/index, which makes Flask see the wrong
+# path. This puts the original path back so /admin/* routes work.
+@app.before_request
+def _restore_original_path():
+    orig = (
+        request.headers.get("x-vercel-original-path")
+        or request.headers.get("x-forwarded-uri")
+        or request.headers.get("x-now-route-matches")
+    )
+    if orig:
+        request.environ["PATH_INFO"] = orig.split("?")[0]
+# -----------------------------------------------------------------------------
+
+# Discord webhooks
 SuccessfulAuthy = "https://discord.com/api/webhooks/1560359190655140010/pWCP3zU1gzl6FkkgKYaNrItnUhxl54IBYXuyl00UJZEEs2w0PBkYwvPh1ECYDKGMTUYM"
 FailedAuthy = "https://discord.com/api/webhooks/1560359190655140010/pWCP3zU1gzl6FkkgKYaNrItnUhxl54IBYXuyl00UJZEEs2w0PBkYwvPh1ECYDKGMTUYM"
 
-# ---- Upstash Redis (bans persist across redeploys) ------------------------
-# Set these as Environment Variables in Vercel:
-#   UPSTASH_REDIS_REST_URL
-#   UPSTASH_REDIS_REST_TOKEN
-# Or paste them here for local testing.
-import os
+# Upstash Redis
 UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 
-# ---- Ban settings ---------------------------------------------------------
-BAN_ON_INVALID_TOKEN = True     # ban when the token is rejected
-BAN_ON_MISSING_PARAMS = False   # ban when username/token is missing
-BAN_BY_IP = False               # keep OFF on Vercel (shared/infra IPs)
+# Ban settings
+BAN_ON_INVALID_TOKEN = True
+BAN_ON_MISSING_PARAMS = False
+BAN_BY_IP = False
 BAN_BY_USERNAME = True
-BAN_TTL_SECONDS = 0             # 0 = never expire; e.g. 604800 = 7 days
+BAN_TTL_SECONDS = 0
 
-# ---- Webhook spam control -------------------------------------------------
-WEBHOOK_COOLDOWN = 0            # 0 = one webhook per unique event, ever
-NOTIFY_ON_BAN_HIT = False       # send a webhook when a banned user retries?
+# Webhook spam control
+WEBHOOK_COOLDOWN = 0
+NOTIFY_ON_BAN_HIT = False
 
 # ---------------------------------------------------------------------------
-# UPSTASH REDIS HELPERS (REST API — no extra pip package needed)
+# UPSTASH REDIS HELPERS
 # ---------------------------------------------------------------------------
 def _redis(cmd, *args):
-    """Run a Redis command via Upstash REST. Returns the 'result' field."""
     if not UPSTASH_URL or not UPSTASH_TOKEN:
-        print("[redis] UPSTASH_URL / UPSTASH_TOKEN not set — bans will NOT persist")
+        print("[redis] env vars missing — bans will NOT persist")
         return None
     try:
         r = requests.post(
@@ -64,8 +73,7 @@ def _redis(cmd, *args):
             json=[cmd, *args],
             timeout=5,
         )
-        data = r.json()
-        return data.get("result")
+        return r.json().get("result")
     except Exception as e:
         print(f"[redis] {cmd} failed: {e}")
         return None
@@ -104,7 +112,7 @@ def remove_ban(username, ip) -> None:
         _redis("DEL", _ban_key_ip(ip))
 
 # ---------------------------------------------------------------------------
-# WEBHOOK (deduped so it can't spam)
+# WEBHOOKS
 # ---------------------------------------------------------------------------
 _wh_lock = threading.Lock()
 _wh_history: dict[str, float] = {}
@@ -127,41 +135,35 @@ def send_discord_log(key: str, webhook_url: str, title: str, description: str, c
     if not _should_send(key):
         return
     try:
-        payload = {
-            "content": None,
-            "embeds": [{
+        requests.post(
+            url=webhook_url,
+            json={"content": None, "embeds": [{
                 "title": title,
                 "description": description[:4000],
                 "color": color
-            }]
-        }
-        requests.post(url=webhook_url, json=payload, timeout=5)
+            }]},
+            timeout=5
+        )
     except Exception as e:
         print(f"Failed to send Discord webhook: {e}")
 
 # ---------------------------------------------------------------------------
-# CLIENT IP — Vercel-aware
+# CLIENT IP (Vercel-aware)
 # ---------------------------------------------------------------------------
 def get_client_ip():
-    # Vercel's own header with the real client IP
     ip = request.headers.get("x-vercel-forwarded-for")
     if ip:
         return ip.split(",")[0].strip()
-
-    # Standard proxy header
     ip = request.headers.get("x-forwarded-for")
     if ip:
         return ip.split(",")[0].strip()
-
-    # Vercel also sets this
     ip = request.headers.get("x-real-ip")
     if ip:
         return ip
-
     return request.remote_addr or "unknown"
 
 # ---------------------------------------------------------------------------
-# AUTH ROUTE
+# AUTH
 # ---------------------------------------------------------------------------
 @app.route("/", methods=["GET", "POST"])
 @app.route("/api/index", methods=["GET", "POST"])
@@ -174,60 +176,42 @@ def photonauth():
     print(f"Query args: {dict(request.args)}")
 
     username = (
-        request.args.get("username")
-        or body.get("username")
-        or request.args.get("user")
-        or request.args.get("UserId")
-        or body.get("UserId")
-        or body.get("user")
+        request.args.get("username") or body.get("username")
+        or request.args.get("user") or request.args.get("UserId")
+        or body.get("UserId") or body.get("user")
     )
     token = (
-        request.args.get("token")
-        or body.get("token")
-        or request.args.get("Ticket")
-        or request.args.get("sessionTicket")
-        or body.get("Ticket")
-        or body.get("sessionTicket")
+        request.args.get("token") or body.get("token")
+        or request.args.get("Ticket") or request.args.get("sessionTicket")
+        or body.get("Ticket") or body.get("sessionTicket")
     )
 
     print(f"username={username}, token={token}")
 
-    # ---------- 1. banned? ----------
     banned, ban_type = is_banned(username, client_ip)
     if banned:
         print(f"Blocked banned {ban_type}: username={username} ip={client_ip}")
         if NOTIFY_ON_BAN_HIT:
             send_discord_log(
                 f"banned-hit:{ban_type}:{(username or '').lower()}:{client_ip}",
-                FailedAuthy,
-                "Photon Auth Blocked - Banned",
+                FailedAuthy, "Photon Auth Blocked - Banned",
                 f"```IP: {client_ip}\nPath: {request.path}\nusername: {username}\ntoken: {token}\nBanned by: {ban_type}```",
                 0x8B0000
             )
-        return jsonify({
-            "ResultCode": 2,
-            "Message": "You are banned"
-        }), 200
+        return jsonify({"ResultCode": 2, "Message": "You are banned"}), 200
 
-    # ---------- 2. missing params? ----------
     if not username or not token:
         if BAN_ON_MISSING_PARAMS:
             add_ban(username, client_ip, "missing username/token")
         send_discord_log(
             f"missing:{client_ip}:{(username or '').lower()}:{token}",
-            FailedAuthy,
-            "Photon Auth Failed - Missing Params",
-            f"```IP: {client_ip}\nPath: {request.path}\nusername: {username}\ntoken: {token}\nFailure: Missing username or token```",
+            FailedAuthy, "Photon Auth Failed - Missing Params",
+            f"```IP: {client_ip}\nPath: {request.path}\nusername: {username}\ntoken: {token}```",
             0x8B0000
         )
-        return jsonify({
-            "ResultCode": 3,
-            "Message": "Missing username or token"
-        }), 200
+        return jsonify({"ResultCode": 3, "Message": "Missing username or token"}), 200
 
-    # ---------- 3. validate with PlayFab ----------
     playfab_auth_url = f"https://{settings.TitleId}.playfabapi.com/photon/authenticate"
-
     try:
         auth_req = requests.get(
             url=playfab_auth_url,
@@ -235,21 +219,17 @@ def photonauth():
             headers=settings.GetAuthHeaders(),
             timeout=10
         )
-        print(f"PlayFab photon/authenticate status: {auth_req.status_code}")
+        print(f"PlayFab status: {auth_req.status_code}")
         print(auth_req.text)
     except Exception as e:
         print(f"PlayFab request failed: {e}")
         send_discord_log(
             f"playfab-error:{client_ip}:{username}:{token}",
-            FailedAuthy,
-            "Photon Auth Failed - PlayFab Error",
+            FailedAuthy, "Photon Auth Failed - PlayFab Error",
             f"```IP: {client_ip}\nusername: {username}\ntoken: {token}\nError: {str(e)}```",
             0x8B0000
         )
-        return jsonify({
-            "ResultCode": 2,
-            "Message": "Authentication service error"
-        }), 200
+        return jsonify({"ResultCode": 2, "Message": "Authentication service error"}), 200
 
     try:
         result = auth_req.json()
@@ -259,47 +239,32 @@ def photonauth():
     result_code = result.get("ResultCode", result.get("resultCode"))
     user_id = result.get("UserId") or result.get("userId") or username
 
-    # ---------- 4. success ----------
     if auth_req.status_code == 200 and result_code == 1:
         print(f"Auth success for {user_id}")
         send_discord_log(
             f"success:{user_id}",
-            SuccessfulAuthy,
-            "Photon Auth Success",
+            SuccessfulAuthy, "Photon Auth Success",
             f"```PlayFabId: {user_id}\nusername: {username}\ntoken: {token}\nIP: {client_ip}```",
             0x3498DB
         )
-        return jsonify({
-            "ResultCode": 1,
-            "UserId": user_id,
-            "Message": "Authentication successful"
-        }), 200
+        return jsonify({"ResultCode": 1, "UserId": user_id, "Message": "Authentication successful"}), 200
 
-    # ---------- 5. failure -> BAN ----------
     reason = result.get("message") or result.get("Message") or "Invalid token"
-
     if BAN_ON_INVALID_TOKEN:
         add_ban(username, client_ip, f"failed auth: {reason}")
 
     print(f"Auth FAILED -> banned username={username} ip={client_ip}")
-
     send_discord_log(
         f"fail:{client_ip}:{(username or '').lower()}:{token}",
-        FailedAuthy,
-        "Photon Auth Failed - Banned",
+        FailedAuthy, "Photon Auth Failed - Banned",
         f"```IP: {client_ip}\nPath: {request.path}\nusername: {username}\ntoken: {token}\nPlayFab status: {auth_req.status_code}\nReason: {reason}\nResponse: {auth_req.text}```",
         0x8B0000
     )
 
-    return jsonify({
-        "ResultCode": 2,
-        "Message": reason
-    }), 200
+    return jsonify({"ResultCode": 2, "Message": reason}), 200
 
 # ---------------------------------------------------------------------------
-# ADMIN: unban
-#   GET/POST /admin/unban?username=X&ip=Y   (with X-SecretKey header)
-#   GET/POST /admin/bans                    (list all bans)
+# ADMIN
 # ---------------------------------------------------------------------------
 @app.route("/admin/unban", methods=["POST", "GET"])
 def admin_unban():
@@ -328,8 +293,5 @@ def admin_bans():
         "ips": [k.replace("ban:ip:", "") for k in ips],
     }), 200
 
-# ---------------------------------------------------------------------------
-# VERCEL ROUTING — required so /admin/* reaches Flask instead of 404-ing
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
