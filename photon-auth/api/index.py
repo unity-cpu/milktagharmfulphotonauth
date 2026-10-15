@@ -1,5 +1,3 @@
-import hashlib
-import hmac
 import os
 import threading
 import time
@@ -18,12 +16,6 @@ class GameInfo:
 
         # Must match Unity's APP_ID_REALTIME
         self.PhotonAppId: str = "d367d3f3-d294-4eef-8b35-3d0722fab130"
-
-        # ============================================================
-        #  HARDENING
-        # ============================================================
-        # Shared HMAC-SHA256 secret. MUST match CLIENT_HMAC_SECRET in Unity.
-        self.ClientHmacSecret: str = "REPLACE_ME_WITH_A_LONG_RANDOM_HEX_STRING_AT_LEAST_64_CHARS"
 
         # Must match Unity's APP_VERSION. Empty to disable.
         self.ExpectedAppVersion: str = "live11143"
@@ -153,19 +145,6 @@ def _version_ok(v) -> bool:
         return True
     return v == settings.ExpectedAppVersion
 
-def _verify_hmac(username: str, token: str, ts: str, nonce: str, sig: str) -> bool:
-    if not settings.ClientHmacSecret or settings.ClientHmacSecret.startswith("REPLACE_ME"):
-        return False
-    if not sig:
-        return False
-    message = f"{username}|{token}|{ts}|{nonce}"
-    expected = hmac.new(
-        settings.ClientHmacSecret.encode(),
-        message.encode(),
-        hashlib.sha256,
-    ).hexdigest()
-    return hmac.compare_digest(expected, sig.lower())
-
 # ---------------------------------------------------------------------------
 # WEBHOOKS
 # ---------------------------------------------------------------------------
@@ -291,7 +270,6 @@ def photonauth():
     token    = _getp(body, "token", "Ticket", "sessionTicket")
     ts       = _getp(body, "ts", "timestamp")
     nonce    = _getp(body, "nonce")
-    sig      = _getp(body, "sig", "signature")
     app_ver  = _getp(body, "appVersion", "version", "AppVersion")
 
     # HARDENING LAYER 1: rate limit
@@ -344,19 +322,7 @@ def photonauth():
         )
         return jsonify({"ResultCode": 5, "Message": "Timestamp out of range"}), 200
 
-    # HARDENING LAYER 4: HMAC
-    if not _verify_hmac(username, token, ts, nonce, sig):
-        if settings.BanOnHardeningFailure:
-            add_ban(username, client_ip, "bad hmac signature")
-        send_discord_log(
-            f"hard-hmac:{client_ip}:{username}",
-            FailedAuthy, "Photon Auth Blocked - Bad Signature",
-            f"```IP: {client_ip}\nusername: {username}\nReceived sig: {sig}```",
-            0x8B0000
-        )
-        return jsonify({"ResultCode": 5, "Message": "Bad signature"}), 200
-
-    # HARDENING LAYER 5: nonce replay
+    # HARDENING LAYER 4: nonce replay
     if not nonce or not _consume_nonce(nonce):
         if settings.BanOnHardeningFailure:
             add_ban(username, client_ip, f"nonce replay: {nonce}")
