@@ -23,20 +23,6 @@ class GameInfo:
 settings = GameInfo()
 app = Flask(__name__)
 
-# --- VERCEL PATH RESTORATION -------------------------------------------------
-# Vercel rewrites every path to /api/index, which makes Flask see the wrong
-# path. This puts the original path back so /admin/* routes work.
-@app.before_request
-def _restore_original_path():
-    orig = (
-        request.headers.get("x-vercel-original-path")
-        or request.headers.get("x-forwarded-uri")
-        or request.headers.get("x-now-route-matches")
-    )
-    if orig:
-        request.environ["PATH_INFO"] = orig.split("?")[0]
-# -----------------------------------------------------------------------------
-
 # Discord webhooks
 SuccessfulAuthy = "https://discord.com/api/webhooks/1560359190655140010/pWCP3zU1gzl6FkkgKYaNrItnUhxl54IBYXuyl00UJZEEs2w0PBkYwvPh1ECYDKGMTUYM"
 FailedAuthy = "https://discord.com/api/webhooks/1560359190655140010/pWCP3zU1gzl6FkkgKYaNrItnUhxl54IBYXuyl00UJZEEs2w0PBkYwvPh1ECYDKGMTUYM"
@@ -163,11 +149,8 @@ def get_client_ip():
     return request.remote_addr or "unknown"
 
 # ---------------------------------------------------------------------------
-# AUTH
+# AUTH HANDLER (plain function — no decorator)
 # ---------------------------------------------------------------------------
-@app.route("/", methods=["GET", "POST"])
-@app.route("/api/index", methods=["GET", "POST"])
-@app.route("/api/photon", methods=["GET", "POST"])
 def photonauth():
     client_ip = get_client_ip()
     body = request.get_json(silent=True) or {}
@@ -264,9 +247,8 @@ def photonauth():
     return jsonify({"ResultCode": 2, "Message": reason}), 200
 
 # ---------------------------------------------------------------------------
-# ADMIN
+# ADMIN HANDLERS (plain functions — no decorators)
 # ---------------------------------------------------------------------------
-@app.route("/admin/unban", methods=["POST", "GET"])
 def admin_unban():
     key = request.headers.get("X-SecretKey") or request.args.get("secret")
     if not settings.SecretKey or key != settings.SecretKey:
@@ -280,7 +262,6 @@ def admin_unban():
     remove_ban(username, ip)
     return jsonify({"ok": True, "unbanned": {"username": username, "ip": ip}}), 200
 
-@app.route("/admin/bans", methods=["GET"])
 def admin_bans():
     key = request.headers.get("X-SecretKey") or request.args.get("secret")
     if not settings.SecretKey or key != settings.SecretKey:
@@ -292,6 +273,23 @@ def admin_bans():
         "usernames": [k.replace("ban:u:", "") for k in usernames],
         "ips": [k.replace("ban:ip:", "") for k in ips],
     }), 200
+
+# ---------------------------------------------------------------------------
+# CATCH-ALL ROUTE — Vercel sends everything here
+# ---------------------------------------------------------------------------
+@app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
+@app.route("/<path:path>", methods=["GET", "POST"])
+def catch_all(path):
+    full_path = "/" + path if path else "/"
+
+    print(f"[catch_all] reconstructed path: {full_path}")
+
+    if full_path.startswith("/admin/unban"):
+        return admin_unban()
+    elif full_path.startswith("/admin/bans"):
+        return admin_bans()
+    else:
+        return photonauth()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
