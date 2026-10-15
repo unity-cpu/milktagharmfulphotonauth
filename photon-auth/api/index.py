@@ -149,7 +149,7 @@ def get_client_ip():
     return request.remote_addr or "unknown"
 
 # ---------------------------------------------------------------------------
-# AUTH HANDLER (plain function — no decorator)
+# AUTH HANDLER
 # ---------------------------------------------------------------------------
 def photonauth():
     client_ip = get_client_ip()
@@ -219,19 +219,40 @@ def photonauth():
     except Exception:
         result = {}
 
+    # PlayFab wraps data under "data" sometimes; unwrap if present
+    if "data" in result and isinstance(result["data"], dict):
+        result = result["data"]
+
     result_code = result.get("ResultCode", result.get("resultCode"))
     user_id = result.get("UserId") or result.get("userId") or username
 
+    # ---------- SUCCESS ----------
     if auth_req.status_code == 200 and result_code == 1:
-        print(f"Auth success for {user_id}")
+        # THIS IS THE LINE YOU WERE MISSING
+        photon_token = (
+            result.get("PhotonToken")
+            or result.get("photonToken")
+            or result.get("Token")
+            or result.get("token")
+        )
+
+        print(f"Auth success for {user_id}, PhotonToken={'yes' if photon_token else 'NO'}")
+
         send_discord_log(
             f"success:{user_id}",
             SuccessfulAuthy, "Photon Auth Success",
-            f"```PlayFabId: {user_id}\nusername: {username}\ntoken: {token}\nIP: {client_ip}```",
+            f"```PlayFabId: {user_id}\nusername: {username}\nIP: {client_ip}```",
             0x3498DB
         )
-        return jsonify({"ResultCode": 1, "UserId": user_id, "Message": "Authentication successful"}), 200
 
+        return jsonify({
+            "ResultCode": 1,
+            "UserId": user_id,
+            "PhotonToken": photon_token,
+            "Message": "Authentication successful"
+        }), 200
+
+    # ---------- FAILURE ----------
     reason = result.get("message") or result.get("Message") or "Invalid token"
     if BAN_ON_INVALID_TOKEN:
         add_ban(username, client_ip, f"failed auth: {reason}")
@@ -247,7 +268,7 @@ def photonauth():
     return jsonify({"ResultCode": 2, "Message": reason}), 200
 
 # ---------------------------------------------------------------------------
-# ADMIN HANDLERS (plain functions — no decorators)
+# ADMIN HANDLERS
 # ---------------------------------------------------------------------------
 def admin_unban():
     key = request.headers.get("X-SecretKey") or request.args.get("secret")
@@ -275,7 +296,7 @@ def admin_bans():
     }), 200
 
 # ---------------------------------------------------------------------------
-# CATCH-ALL ROUTE — Vercel sends everything here
+# CATCH-ALL (required for Vercel rewrites)
 # ---------------------------------------------------------------------------
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
 @app.route("/<path:path>", methods=["GET", "POST"])
@@ -284,9 +305,9 @@ def catch_all(path):
 
     print(f"[catch_all] reconstructed path: {full_path}")
 
-    if full_path.startswith("/admin/unban"):
+    if "admin/unban" in full_path or "admin/unban" in request.path:
         return admin_unban()
-    elif full_path.startswith("/admin/bans"):
+    elif "admin/bans" in full_path or "admin/bans" in request.path:
         return admin_bans()
     else:
         return photonauth()
