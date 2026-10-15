@@ -30,7 +30,7 @@ class GameInfo:
         self.RateLimitMax: int = 15
         self.RateLimitWindow: int = 60
 
-        # Auto-ban on hardening failures
+        # Auto-ban on hardening failures (nonce replay is NOT included)
         self.BanOnHardeningFailure: bool = True
 
     def GetAuthHeaders(self) -> dict[str, str]:
@@ -126,12 +126,28 @@ def _rate_limit_check(ip: str) -> bool:
     except (TypeError, ValueError):
         return True
 
-def _consume_nonce(nonce: str) -> bool:
+def _consume_nonce(nonce: str, username: str, token: str) -> bool:
+    """
+    Returns True if the nonce is fresh OR if it's a retry of the exact
+    same request. Returns False only when the same nonce is reused with
+    a DIFFERENT (username, ticket) pair — that's the actual replay case.
+    """
     if not UPSTASH_URL or not UPSTASH_TOKEN:
         return True
+
     key = f"nonce:{nonce}"
-    result = _redis("SET", key, "1", "EX", str(settings.NonceTtl), "NX")
-    return result == "OK"
+    fingerprint = f"{username}|{token}"
+
+    result = _redis("SET", key, fingerprint, "EX", str(settings.NonceTtl), "NX")
+
+    if result == "OK":
+        return True  # brand new nonce
+
+    existing = _redis("GET", key)
+    if existing == fingerprint:
+        return True  # same request retried — allow
+
+    return False  # same nonce, different request — replay
 
 def _timestamp_ok(ts) -> bool:
     try:
@@ -323,9 +339,9 @@ def photonauth():
         return jsonify({"ResultCode": 5, "Message": "Timestamp out of range"}), 200
 
     # HARDENING LAYER 4: nonce replay
-    if not nonce or not _consume_nonce(nonce):
-        if settings.BanOnHardeningFailure:
-            add_ban(username, client_ip, f"nonce replay: {nonce}")
+    # NOTE: no add_ban here on purpose — Photon retries legitimate requests,
+    # and Redis races can produce false positives. Reject only.
+    if not nonce or not _consume_nonce(nonce, username, token):
         send_discord_log(
             f"hard-nonce:{client_ip}:{username}",
             FailedAuthy, "Photon Auth Blocked - Replay",
