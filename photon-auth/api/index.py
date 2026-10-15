@@ -1,5 +1,4 @@
 import json
-import os
 import threading
 import time
 import requests
@@ -24,72 +23,85 @@ settings = GameInfo()
 app = Flask(__name__)
 
 # Discord webhooks (leave empty to disable)
-SuccessfulAuthy = "https://discord.com/api/webhooks/1560359190655140010/pWCP3zU1gzl6FkkgKYaNrItnUhxl54IBYXuyl00UJZEEs2w0PBkYwvPh1ECYDKGMTUYM"  # Webhook URL for successful auths
-FailedAuthy = "https://discord.com/api/webhooks/1560359190655140010/pWCP3zU1gzl6FkkgKYaNrItnUhxl54IBYXuyl00UJZEEs2w0PBkYwvPh1ECYDKGMTUYM"      # Webhook URL for failed auths
+SuccessfulAuthy = "https://discord.com/api/webhooks/1560359190655140010/pWCP3zU1gzl6FkkgKYaNrItnUhxl54IBYXuyl00UJZEEs2w0PBkYwvPh1ECYDKGMTUYM"
+FailedAuthy = "https://discord.com/api/webhooks/1560359190655140010/pWCP3zU1gzl6FkkgKYaNrItnUhxl54IBYXuyl00UJZEEs2w0PBkYwvPh1ECYDKGMTUYM"
+
+# ---- Upstash Redis (bans persist across redeploys) ------------------------
+# Set these as Environment Variables in Vercel:
+#   UPSTASH_REDIS_REST_URL
+#   UPSTASH_REDIS_REST_TOKEN
+# Or paste them here for local testing.
+import os
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 
 # ---- Ban settings ---------------------------------------------------------
-BAN_FILE = "bans.json"          # where bans are stored
 BAN_ON_INVALID_TOKEN = True     # ban when the token is rejected
 BAN_ON_MISSING_PARAMS = False   # ban when username/token is missing
-BAN_BY_IP = False                # also ban the IP (turn off if players share IPs)
+BAN_BY_IP = False               # keep OFF on Vercel (shared/infra IPs)
 BAN_BY_USERNAME = True
+BAN_TTL_SECONDS = 0             # 0 = never expire; e.g. 604800 = 7 days
 
 # ---- Webhook spam control -------------------------------------------------
-# 0  = send ONE webhook per unique event, ever (until restart)
-# 60 = send at most one webhook per unique event every 60 seconds
-WEBHOOK_COOLDOWN = 0
+WEBHOOK_COOLDOWN = 0            # 0 = one webhook per unique event, ever
+NOTIFY_ON_BAN_HIT = False       # send a webhook when a banned user retries?
 
 # ---------------------------------------------------------------------------
-# BAN STORAGE
+# UPSTASH REDIS HELPERS (REST API — no extra pip package needed)
 # ---------------------------------------------------------------------------
-_ban_lock = threading.Lock()
-
-def _load_bans() -> dict:
-    if not os.path.exists(BAN_FILE):
-        return {"usernames": {}, "ips": {}}
+def _redis(cmd, *args):
+    """Run a Redis command via Upstash REST. Returns the 'result' field."""
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        print("[redis] UPSTASH_URL / UPSTASH_TOKEN not set — bans will NOT persist")
+        return None
     try:
-        with open(BAN_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        r = requests.post(
+            UPSTASH_URL,
+            headers={
+                "Authorization": f"Bearer {UPSTASH_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json=[cmd, *args],
+            timeout=5,
+        )
+        data = r.json()
+        return data.get("result")
     except Exception as e:
-        print(f"[bans] failed to load: {e}")
-        return {"usernames": {}, "ips": {}}
-    data.setdefault("usernames", {})
-    data.setdefault("ips", {})
-    return data
+        print(f"[redis] {cmd} failed: {e}")
+        return None
 
-def _save_bans(data: dict) -> None:
-    try:
-        with open(BAN_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print(f"[bans] failed to save: {e}")
+def _ban_key_username(username: str) -> str:
+    return f"ban:u:{username.lower()}"
 
-bans = _load_bans()
+def _ban_key_ip(ip: str) -> str:
+    return f"ban:ip:{ip}"
 
-def is_banned(username: str | None, ip: str | None) -> tuple[bool, str]:
-    with _ban_lock:
-        if username and username.lower() in bans["usernames"]:
-            return True, "username"
-        if ip and ip in bans["ips"]:
-            return True, "ip"
+def is_banned(username, ip):
+    if username and _redis("EXISTS", _ban_key_username(username)):
+        return True, "username"
+    if BAN_BY_IP and ip and _redis("EXISTS", _ban_key_ip(ip)):
+        return True, "ip"
     return False, ""
 
-def add_ban(username: str | None, ip: str | None, reason: str) -> None:
-    with _ban_lock:
-        now = time.time()
-        if BAN_BY_USERNAME and username:
-            bans["usernames"][username.lower()] = {"reason": reason, "banned_at": now}
-        if BAN_BY_IP and ip:
-            bans["ips"][ip] = {"reason": reason, "banned_at": now}
-        _save_bans(bans)
+def add_ban(username, ip, reason: str) -> None:
+    if BAN_BY_USERNAME and username:
+        key = _ban_key_username(username)
+        if BAN_TTL_SECONDS > 0:
+            _redis("SET", key, reason, "EX", str(BAN_TTL_SECONDS))
+        else:
+            _redis("SET", key, reason)
+    if BAN_BY_IP and ip:
+        key = _ban_key_ip(ip)
+        if BAN_TTL_SECONDS > 0:
+            _redis("SET", key, reason, "EX", str(BAN_TTL_SECONDS))
+        else:
+            _redis("SET", key, reason)
 
-def remove_ban(username: str | None, ip: str | None) -> None:
-    with _ban_lock:
-        if username:
-            bans["usernames"].pop(username.lower(), None)
-        if ip:
-            bans["ips"].pop(ip, None)
-        _save_bans(bans)
+def remove_ban(username, ip) -> None:
+    if username:
+        _redis("DEL", _ban_key_username(username))
+    if ip:
+        _redis("DEL", _ban_key_ip(ip))
 
 # ---------------------------------------------------------------------------
 # WEBHOOK (deduped so it can't spam)
@@ -110,8 +122,6 @@ def _should_send(key: str) -> bool:
         return False
 
 def send_discord_log(key: str, webhook_url: str, title: str, description: str, color: int):
-    """key = unique identifier for this event. Same key is only sent once
-    (or once per WEBHOOK_COOLDOWN seconds)."""
     if not webhook_url:
         return
     if not _should_send(key):
@@ -129,11 +139,26 @@ def send_discord_log(key: str, webhook_url: str, title: str, description: str, c
     except Exception as e:
         print(f"Failed to send Discord webhook: {e}")
 
+# ---------------------------------------------------------------------------
+# CLIENT IP — Vercel-aware
+# ---------------------------------------------------------------------------
 def get_client_ip():
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-    if client_ip and "," in client_ip:
-        client_ip = client_ip.split(",")[0].strip()
-    return client_ip or "unknown"
+    # Vercel's own header with the real client IP
+    ip = request.headers.get("x-vercel-forwarded-for")
+    if ip:
+        return ip.split(",")[0].strip()
+
+    # Standard proxy header
+    ip = request.headers.get("x-forwarded-for")
+    if ip:
+        return ip.split(",")[0].strip()
+
+    # Vercel also sets this
+    ip = request.headers.get("x-real-ip")
+    if ip:
+        return ip
+
+    return request.remote_addr or "unknown"
 
 # ---------------------------------------------------------------------------
 # AUTH ROUTE
@@ -148,7 +173,6 @@ def photonauth():
     print(f"Received {request.method} {request.path} from {client_ip}")
     print(f"Query args: {dict(request.args)}")
 
-    # --- pull username / token from anywhere the client puts them ---
     username = (
         request.args.get("username")
         or body.get("username")
@@ -166,20 +190,20 @@ def photonauth():
         or body.get("sessionTicket")
     )
 
-    # FULL token, no truncation
     print(f"username={username}, token={token}")
 
     # ---------- 1. banned? ----------
     banned, ban_type = is_banned(username, client_ip)
     if banned:
         print(f"Blocked banned {ban_type}: username={username} ip={client_ip}")
-        send_discord_log(
-            f"banned-hit:{ban_type}:{(username or '').lower()}:{client_ip}",
-            FailedAuthy,
-            "Photon Auth Blocked - Banned",
-            f"```IP: {client_ip}\nPath: {request.path}\nusername: {username}\ntoken: {token}\nBanned by: {ban_type}```",
-            0x8B0000
-        )
+        if NOTIFY_ON_BAN_HIT:
+            send_discord_log(
+                f"banned-hit:{ban_type}:{(username or '').lower()}:{client_ip}",
+                FailedAuthy,
+                "Photon Auth Blocked - Banned",
+                f"```IP: {client_ip}\nPath: {request.path}\nusername: {username}\ntoken: {token}\nBanned by: {ban_type}```",
+                0x8B0000
+            )
         return jsonify({
             "ResultCode": 2,
             "Message": "You are banned"
@@ -232,7 +256,6 @@ def photonauth():
     except Exception:
         result = {}
 
-    # PlayFab replies with lowercase "resultCode" -> check both casings
     result_code = result.get("ResultCode", result.get("resultCode"))
     user_id = result.get("UserId") or result.get("userId") or username
 
@@ -252,7 +275,7 @@ def photonauth():
             "Message": "Authentication successful"
         }), 200
 
-    # ---------- 5. failure -> BAN + full token in webhook ----------
+    # ---------- 5. failure -> BAN ----------
     reason = result.get("message") or result.get("Message") or "Invalid token"
 
     if BAN_ON_INVALID_TOKEN:
@@ -274,7 +297,9 @@ def photonauth():
     }), 200
 
 # ---------------------------------------------------------------------------
-# ADMIN: unban (POST /admin/unban?username=X&ip=Y  with X-SecretKey header)
+# ADMIN: unban
+#   GET/POST /admin/unban?username=X&ip=Y   (with X-SecretKey header)
+#   GET/POST /admin/bans                    (list all bans)
 # ---------------------------------------------------------------------------
 @app.route("/admin/unban", methods=["POST", "GET"])
 def admin_unban():
@@ -290,5 +315,21 @@ def admin_unban():
     remove_ban(username, ip)
     return jsonify({"ok": True, "unbanned": {"username": username, "ip": ip}}), 200
 
+@app.route("/admin/bans", methods=["GET"])
+def admin_bans():
+    key = request.headers.get("X-SecretKey") or request.args.get("secret")
+    if not settings.SecretKey or key != settings.SecretKey:
+        return jsonify({"error": "unauthorized"}), 403
+
+    usernames = _redis("KEYS", "ban:u:*") or []
+    ips = _redis("KEYS", "ban:ip:*") or []
+    return jsonify({
+        "usernames": [k.replace("ban:u:", "") for k in usernames],
+        "ips": [k.replace("ban:ip:", "") for k in ips],
+    }), 200
+
+# ---------------------------------------------------------------------------
+# VERCEL ROUTING — required so /admin/* reaches Flask instead of 404-ing
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
