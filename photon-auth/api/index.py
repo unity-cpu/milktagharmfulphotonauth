@@ -31,7 +31,7 @@ FailedAuthy = "https://discord.com/api/webhooks/1560359190655140010/pWCP3zU1gzl6
 BAN_FILE = "bans.json"          # where bans are stored
 BAN_ON_INVALID_TOKEN = True     # ban when the token is rejected
 BAN_ON_MISSING_PARAMS = False   # ban when username/token is missing
-BAN_BY_IP = True                # also ban the IP (turn off if players share IPs)
+BAN_BY_IP = False                # also ban the IP (turn off if players share IPs)
 BAN_BY_USERNAME = True
 
 # ---- Webhook spam control -------------------------------------------------
