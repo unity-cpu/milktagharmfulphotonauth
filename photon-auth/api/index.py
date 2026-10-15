@@ -297,7 +297,7 @@ def photonauth():
         if NOTIFY_ON_BAN_HIT:
             send_discord_log(
                 f"banned-hit:{ban_type}:{(username or '').lower()}:{client_ip}",
-                FailedAuthy, "Photon Auth Blocked - Banned",
+                FailedAuthy, "Photon Auth Failed",
                 f"```IP: {client_ip}\nPath: {request.path}\nusername: {username}\ntoken: {token}\nBanned by: {ban_type}```",
                 0x8B0000
             )
@@ -305,14 +305,14 @@ def photonauth():
 
     if not username or not token:
         if BAN_ON_MISSING_PARAMS:
-            add_ban(username, client_ip, "missing username/token")
+            add_ban(username, client_ip, "missing token")
         send_discord_log(
             f"missing:{client_ip}:{(username or '').lower()}:{token}",
             FailedAuthy, "Photon Auth Failed - Missing Params",
             f"```IP: {client_ip}\nPath: {request.path}\nusername: {username}\ntoken: {token}```",
             0x8B0000
         )
-        return jsonify({"ResultCode": 3, "Message": "Missing username or token"}), 200
+        return jsonify({"ResultCode": 3, "Message": "Missing token"}), 200
 
     # HARDENING LAYER 2: version
     if not _version_ok(app_ver):
@@ -320,7 +320,7 @@ def photonauth():
             add_ban(username, client_ip, f"bad app version: {app_ver}")
         send_discord_log(
             f"hard-version:{client_ip}:{username}",
-            FailedAuthy, "Photon Auth Blocked - Version",
+            FailedAuthy, "Photon Auth Failed - Version",
             f"```IP: {client_ip}\nusername: {username}\nappVersion: {app_ver}\nexpected: {settings.ExpectedAppVersion}```",
             0x8B0000
         )
@@ -332,7 +332,7 @@ def photonauth():
             add_ban(username, client_ip, f"bad timestamp: {ts}")
         send_discord_log(
             f"hard-ts:{client_ip}:{username}",
-            FailedAuthy, "Photon Auth Blocked - Timestamp",
+            FailedAuthy, "Photon Auth Failed - Timestamp",
             f"```IP: {client_ip}\nusername: {username}\nts: {ts}\nskew limit: {settings.MaxTimestampSkew}s```",
             0x8B0000
         )
@@ -344,7 +344,7 @@ def photonauth():
     if not nonce or not _consume_nonce(nonce, username, token):
         send_discord_log(
             f"hard-nonce:{client_ip}:{username}",
-            FailedAuthy, "Photon Auth Blocked - Replay",
+            FailedAuthy, "Photon Auth Failed - Replay",
             f"```IP: {client_ip}\nusername: {username}\nnonce: {nonce}```",
             0x8B0000
         )
@@ -377,7 +377,7 @@ def photonauth():
     if not photon_ok or not photon_token:
         send_discord_log(
             f"success-no-photon:{playfab_id}",
-            SuccessfulAuthy, "Photon Auth OK (no token)",
+            SuccessfulAuthy, "Photon Auth OK",
             f"```PlayFabId: {playfab_id}\nusername: {username}\nIP: {client_ip}\n"
             f"Reason: GetPhotonAuthenticationToken did not return a token\n"
             f"Raw: {photon_data}```",
@@ -394,7 +394,7 @@ def photonauth():
     # FULL SUCCESS — full token, no truncation
     send_discord_log(
         f"success:{playfab_id}",
-        SuccessfulAuthy, "Photon Auth Success",
+        SuccessfulAuthy, "Photon Auth Passed",
         f"```PlayFabId: {playfab_id}\n"
         f"username: {username}\n"
         f"IP: {client_ip}\n"
