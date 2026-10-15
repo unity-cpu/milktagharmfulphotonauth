@@ -21,6 +21,7 @@ app = Flask(__name__)
 SuccessfulAuthy = "https://discord.com/api/webhooks/1560359190655140010/pWCP3zU1gzl6FkkgKYaNrItnUhxl54IBYXuyl00UJZEEs2w0PBkYwvPh1ECYDKGMTUYM"  # Webhook URL for successful auths
 FailedAuthy = "https://discord.com/api/webhooks/1560359190655140010/pWCP3zU1gzl6FkkgKYaNrItnUhxl54IBYXuyl00UJZEEs2w0PBkYwvPh1ECYDKGMTUYM"      # Webhook URL for failed auths
 
+
 def send_discord_log(webhook_url: str, title: str, description: str, color: int):
     if not webhook_url:
         return
@@ -73,17 +74,20 @@ def photonauth():
             "Message": "Missing username or token"
         }), 200
 
-    AuthTicketUrl = f"https://{settings.TitleId}.playfabapi.com/Server/AuthenticateSessionTicket"
-
+    # Validate using PlayFab's official Photon authenticate endpoint
+    playfab_auth_url = f"https://{settings.TitleId}.playfabapi.com/photon/authenticate"
+    
     try:
-        auth_req = requests.post(
-            url=AuthTicketUrl,
-            json={"SessionTicket": token},
-            headers=settings.GetAuthHeaders(),
+        auth_req = requests.get(
+            url=playfab_auth_url,
+            params={
+                "username": username,
+                "token": token
+            },
             timeout=10
         )
-        print(f"PlayFab AuthenticateSessionTicket status: {auth_req.status_code}")
-        print(json.dumps(auth_req.json(), indent=2))
+        print(f"PlayFab photon/authenticate status: {auth_req.status_code}")
+        print(auth_req.text)
     except Exception as e:
         print(f"PlayFab request failed: {e}")
         send_discord_log(
@@ -97,7 +101,27 @@ def photonauth():
             "Message": "Authentication service error"
         }), 200
 
-    if auth_req.status_code != 200:
+    try:
+        result = auth_req.json()
+    except:
+        result = {}
+
+    # PlayFab returns ResultCode 1 on success
+    if auth_req.status_code == 200 and result.get("ResultCode") == 1:
+        user_id = result.get("UserId") or username
+        print(f"Auth success for {user_id}")
+        send_discord_log(
+            SuccessfulAuthy,
+            "Photon Auth Success",
+            f"```PlayFabId: {user_id}\nusername: {username}\nIP: {client_ip}```",
+            0x3498DB
+        )
+        return jsonify({
+            "ResultCode": 1,
+            "UserId": user_id,
+            "Message": "Authentication successful"
+        }), 200
+    else:
         send_discord_log(
             FailedAuthy,
             "Photon Auth Failed - Invalid Token",
@@ -106,30 +130,7 @@ def photonauth():
         )
         return jsonify({
             "ResultCode": 2,
-            "Message": "Invalid token"
+            "Message": result.get("Message", "Invalid token")
         }), 200
-
-    data = auth_req.json().get("data", {})
-    user_info = data.get("UserInfo", {})
-    playfab_id = user_info.get("PlayFabId")
-
-    if playfab_id and username and playfab_id != username:
-        print(f"Note: username ({username}) != PlayFabId from ticket ({playfab_id})")
-
-    user_id_to_return = playfab_id or username
-
-    print(f"Auth success for {user_id_to_return}")
-    send_discord_log(
-        SuccessfulAuthy,
-        "Photon Auth Success",
-        f"```PlayFabId: {user_id_to_return}\nusername: {username}\nIP: {client_ip}```",
-        0x3498DB
-    )
-
-    return jsonify({
-        "ResultCode": 1,
-        "UserId": user_id_to_return,
-        "Message": "Authentication successful"
-    }), 200
 
 app = app
