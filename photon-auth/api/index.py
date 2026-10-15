@@ -273,6 +273,9 @@ def _getp(body, *names):
         v = request.args.get(n)
         if v:
             return v
+        v = request.form.get(n)
+        if v:
+            return v
         v = body.get(n)
         if v:
             return v
